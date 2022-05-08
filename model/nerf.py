@@ -209,9 +209,7 @@ class Graph(base.Graph):
         # render images
         if opt.nerf.rand_rays and mode in ["train","test-optim"]:
             # sample random rays for optimization
-            ray_idx = torch.randperm(opt.H*opt.W,device=opt.device)[:opt.nerf.rand_rays]
-            # NOTE: dejia: per GPU, no need to divide by bs
-            # ray_idx = torch.randperm(opt.H*opt.W,device=opt.device)[:opt.nerf.rand_rays//batch_size]
+            ray_idx = torch.randperm(opt.H*opt.W,device=opt.device)[:opt.nerf.rand_rays//batch_size]
             ret = self.render(opt,pose,intr=var["intr"],ray_idx=ray_idx,mode=mode) # [B,N,3],[B,N,1]
             var["ray_idx"] = ray_idx
         else:
