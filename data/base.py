@@ -31,6 +31,7 @@ class Dataset(torch.utils.data.Dataset):
     def setup_loader(self,opt,shuffle=False,drop_last=False):
         loader = torch.utils.data.DataLoader(self,
             batch_size=opt.batch_size or 1,
+            # batch_size=opt.batch_size or 1,
             num_workers=opt.data.num_workers,
             shuffle=shuffle,
             drop_last=drop_last,

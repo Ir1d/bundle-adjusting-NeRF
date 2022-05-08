@@ -27,13 +27,25 @@ class Model(nerf.Model):
             # pre-generate synthetic pose perturbation
             se3_noise = torch.randn(len(self.train_data),6,device=opt.device)*opt.camera.noise
             self.graph.pose_noise = camera.lie.se3_to_SE3(se3_noise)
+            self.graph.pose_noise = torch.nn.Parameter(self.graph.pose_noise, requires_grad=False)
+            # print(self.graph.pose_noise)
         self.graph.se3_refine = torch.nn.Embedding(len(self.train_data),6).to(opt.device)
         torch.nn.init.zeros_(self.graph.se3_refine.weight)
+        pose,pose_GT = self.get_all_training_poses()
+        _, (t0,  t1,  s0,  s1,  R) = self.prealign_cameras(pose,pose_GT)
+        self.graph.t0 = torch.nn.Parameter(t0, requires_grad=False)
+        self.graph.t1 = torch.nn.Parameter(t1, requires_grad=False)
+        self.graph.s0 = torch.nn.Parameter(s0, requires_grad=False)
+        self.graph.s1 = torch.nn.Parameter(s1, requires_grad=False)
+        self.graph.R = torch.nn.Parameter(R, requires_grad=False)
+        # _,self.graph.sim3 = self.prealign_cameras(pose,pose_GT)
+        # print(self.graph.sim3.t0.device)
+        # self.graph.sim3 = self.graph.sim3.to(opt.device)
 
     def setup_optimizer(self,opt):
         super().setup_optimizer(opt)
         optimizer = getattr(torch.optim,opt.optim.algo)
-        self.optim_pose = optimizer([dict(params=self.graph.se3_refine.parameters(),lr=opt.optim.lr_pose)])
+        self.optim_pose = optimizer([dict(params=self.graph.module.se3_refine.parameters(),lr=opt.optim.lr_pose)])
         # set up scheduler
         if opt.optim.sched_pose:
             scheduler = getattr(torch.optim.lr_scheduler,opt.optim.sched_pose.type)
@@ -54,16 +66,14 @@ class Model(nerf.Model):
         if opt.optim.warmup_pose:
             self.optim_pose.param_groups[0]["lr"] = self.optim_pose.param_groups[0]["lr_orig"] # reset learning rate
         if opt.optim.sched_pose: self.sched_pose.step()
-        self.graph.nerf.progress.data.fill_(self.it/opt.max_iter)
+        self.graph.module.nerf.progress.data.fill_(self.it/opt.max_iter)
         if opt.nerf.fine_sampling:
             self.graph.nerf_fine.progress.data.fill_(self.it/opt.max_iter)
         return loss
 
     @torch.no_grad()
-    def validate(self,opt,ep=None):
-        pose,pose_GT = self.get_all_training_poses(opt)
-        _,self.graph.sim3 = self.prealign_cameras(opt,pose,pose_GT)
-        super().validate(opt,ep=ep)
+    def validate(self,ep=None):
+        super().validate(ep=ep)
 
     @torch.no_grad()
     def log_scalars(self,opt,var,loss,metric=None,step=0,split="train"):
@@ -74,37 +84,52 @@ class Model(nerf.Model):
             self.tb.add_scalar("{0}/{1}".format(split,"lr_pose"),lr,step)
         # compute pose error
         if split=="train" and opt.data.dataset in ["blender","llff"]:
-            pose,pose_GT = self.get_all_training_poses(opt)
-            pose_aligned,_ = self.prealign_cameras(opt,pose,pose_GT)
-            error = self.evaluate_camera_alignment(opt,pose_aligned,pose_GT)
+            pose,pose_GT = self.get_all_training_poses()
+            pose_aligned,_ = self.prealign_cameras(pose,pose_GT)
+            error = self.evaluate_camera_alignment(pose_aligned,pose_GT)
             self.tb.add_scalar("{0}/error_R".format(split),error.R.mean(),step)
             self.tb.add_scalar("{0}/error_t".format(split),error.t.mean(),step)
 
     @torch.no_grad()
-    def visualize(self,opt,var,step=0,split="train"):
-        super().visualize(opt,var,step=step,split=split)
+    def visualize(self,var,step=0,split="train"):
+        super().visualize(var,step=step,split=split)
+        opt = self.opt
         if opt.visdom:
             if split=="val":
-                pose,pose_GT = self.get_all_training_poses(opt)
+                pose,pose_GT = self.get_all_training_poses()
                 util_vis.vis_cameras(opt,self.vis,step=step,poses=[pose,pose_GT])
 
     @torch.no_grad()
-    def get_all_training_poses(self,opt):
+    def get_all_training_poses(self):
+        opt = self.opt
         # get ground-truth (canonical) camera poses
         pose_GT = self.train_data.get_all_camera_poses(opt).to(opt.device)
         # add synthetic pose perturbation to all training data
         if opt.data.dataset=="blender":
             pose = pose_GT
             if opt.camera.noise:
-                pose = camera.pose.compose([self.graph.pose_noise,pose])
-        else: pose = self.graph.pose_eye
+                try:
+                    pose = camera.pose.compose([self.graph.pose_noise,pose])
+                except:
+                    pose = camera.pose.compose([self.graph.module.pose_noise,pose])
+                    
+        else:
+            try:
+                pose = self.graph.pose_eye
+            except:
+                pose = self.graph.module.pose_eye
         # add learned pose correction to all training data
-        pose_refine = camera.lie.se3_to_SE3(self.graph.se3_refine.weight)
+        try:
+            pose_refine = camera.lie.se3_to_SE3(self.graph.se3_refine.weight)
+        except:
+            pose_refine = camera.lie.se3_to_SE3(self.graph.module.se3_refine.weight)
+
         pose = camera.pose.compose([pose_refine,pose])
         return pose,pose_GT
 
     @torch.no_grad()
-    def prealign_cameras(self,opt,pose,pose_GT):
+    def prealign_cameras(self,pose,pose_GT):
+        opt = self.opt
         # compute 3D similarity transform via Procrustes analysis
         center = torch.zeros(1,1,3,device=opt.device)
         center_pred = camera.cam2world(center,pose)[:,0] # [N,3]
@@ -119,7 +144,8 @@ class Model(nerf.Model):
         R_aligned = pose[...,:3]@sim3.R.t()
         t_aligned = (-R_aligned@center_aligned[...,None])[...,0]
         pose_aligned = camera.pose(R=R_aligned,t=t_aligned)
-        return pose_aligned,sim3
+        return pose_aligned, (sim3.t0, sim3.t1, sim3.s0, sim3.s1, sim3.R)
+        # return pose_aligned,sim3
 
     @torch.no_grad()
     def evaluate_camera_alignment(self,opt,pose_aligned,pose_GT):
@@ -135,9 +161,9 @@ class Model(nerf.Model):
     def evaluate_full(self,opt):
         self.graph.eval()
         # evaluate rotation/translation
-        pose,pose_GT = self.get_all_training_poses(opt)
-        pose_aligned,self.graph.sim3 = self.prealign_cameras(opt,pose,pose_GT)
-        error = self.evaluate_camera_alignment(opt,pose_aligned,pose_GT)
+        pose,pose_GT = self.get_all_training_poses()
+        pose_aligned,self.graph.sim3 = self.prealign_cameras(pose,pose_GT)
+        error = self.evaluate_camera_alignment(pose_aligned,pose_GT)
         print("--------------------------")
         print("rot:   {:8.3f}".format(np.rad2deg(error.R.mean().cpu())))
         print("trans: {:10.5f}".format(error.t.mean()))
@@ -151,18 +177,19 @@ class Model(nerf.Model):
         super().evaluate_full(opt)
 
     @torch.enable_grad()
-    def evaluate_test_time_photometric_optim(self,opt,var):
+    def evaluate_test_time_photometric_optim(self,var):
         # use another se3 Parameter to absorb the remaining pose errors
-        var.se3_refine_test = torch.nn.Parameter(torch.zeros(1,6,device=opt.device))
+        opt = self.opt
+        var["se3_refine_test"] = torch.nn.Parameter(torch.zeros(1,6,device=opt.device))
         optimizer = getattr(torch.optim,opt.optim.algo)
-        optim_pose = optimizer([dict(params=[var.se3_refine_test],lr=opt.optim.lr_pose)])
+        optim_pose = optimizer([dict(params=[var["se3_refine_test"]],lr=opt.optim.lr_pose)])
         iterator = tqdm.trange(opt.optim.test_iter,desc="test-time optim.",leave=False,position=1)
         for it in iterator:
             optim_pose.zero_grad()
-            var.pose_refine_test = camera.lie.se3_to_SE3(var.se3_refine_test)
-            var = self.graph.forward(opt,var,mode="test-optim")
-            loss = self.graph.compute_loss(opt,var,mode="test-optim")
-            loss = self.summarize_loss(opt,var,loss)
+            var["pose_refine_test"] = camera.lie.se3_to_SE3(var["se3_refine_test"])
+            var = self.graph.forward(var,mode="test-optim")
+            loss = self.graph.compute_loss(var,mode="test-optim")
+            loss = self.summarize_loss(var,loss)
             loss.all.backward()
             optim_pose.step()
             iterator.set_postfix(loss="{:.3f}".format(loss.all))
@@ -181,9 +208,9 @@ class Model(nerf.Model):
                 try: util.restore_checkpoint(opt,self,resume=ep)
                 except: continue
             # get the camera poses
-            pose,pose_ref = self.get_all_training_poses(opt)
+            pose,pose_ref = self.get_all_training_poses()
             if opt.data.dataset in ["blender","llff"]:
-                pose_aligned,_ = self.prealign_cameras(opt,pose,pose_ref)
+                pose_aligned,_ = self.prealign_cameras(pose,pose_ref)
                 pose_aligned,pose_ref = pose_aligned.detach().cpu(),pose_ref.detach().cpu()
                 dict(
                     blender=util_vis.plot_save_poses_blender,
@@ -215,31 +242,35 @@ class Graph(nerf.Graph):
         self.pose_eye = torch.eye(3,4).to(opt.device)
 
     def get_pose(self,opt,var,mode=None):
+        
+        # for k, v in var.items():
+        #     print(k, v.device)
         if mode=="train":
             # add the pre-generated pose perturbations
             if opt.data.dataset=="blender":
                 if opt.camera.noise:
-                    var.pose_noise = self.pose_noise[var.idx]
-                    pose = camera.pose.compose([var.pose_noise,var.pose])
-                else: pose = var.pose
+                    var["pose_noise"] = self.pose_noise[var["idx"]]
+                    pose = camera.pose.compose([var["pose_noise"],var["pose"]])
+                else: pose = var["pose"]
             else: pose = self.pose_eye
             # add learnable pose correction
-            var.se3_refine = self.se3_refine.weight[var.idx]
-            pose_refine = camera.lie.se3_to_SE3(var.se3_refine)
+            var["se3_refine"] = self.se3_refine.weight[var["idx"]]
+            pose_refine = camera.lie.se3_to_SE3(var["se3_refine"])
             pose = camera.pose.compose([pose_refine,pose])
         elif mode in ["val","eval","test-optim"]:
             # align test pose to refined coordinate system (up to sim3)
-            sim3 = self.sim3
+            # sim3 = self.sim3
             center = torch.zeros(1,1,3,device=opt.device)
-            center = camera.cam2world(center,var.pose)[:,0] # [N,3]
-            center_aligned = (center-sim3.t0)/sim3.s0@sim3.R*sim3.s1+sim3.t1
-            R_aligned = var.pose[...,:3]@self.sim3.R
+            center = camera.cam2world(center,var["pose"])[:,0] # [N,3]
+            # print(center.device, sim3.t0.device)
+            center_aligned = (center-self.t0)/self.s0@self.R*self.s1+self.t1
+            R_aligned = var["pose"][...,:3]@self.R
             t_aligned = (-R_aligned@center_aligned[...,None])[...,0]
             pose = camera.pose(R=R_aligned,t=t_aligned)
             # additionally factorize the remaining pose imperfection
             if opt.optim.test_photo and mode!="val":
-                pose = camera.pose.compose([var.pose_refine_test,pose])
-        else: pose = var.pose
+                pose = camera.pose.compose([var["pose_refine_test"],pose])
+        else: pose = var["pose"]
         return pose
 
 class NeRF(nerf.NeRF):

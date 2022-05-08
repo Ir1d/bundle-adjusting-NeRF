@@ -54,6 +54,7 @@ def set(opt_cmd={}):
 def load_options(fname):
     with open(fname) as file:
         opt = edict(yaml.safe_load(file))
+        
     if "_parent_" in opt:
         # load parent yaml file(s) as base options
         parent_fnames = opt.pop("_parent_")
@@ -101,7 +102,8 @@ def process_options(opt):
     opt.output_path = "{0}/{1}/{2}".format(opt.output_root,opt.group,opt.name)
     os.makedirs(opt.output_path,exist_ok=True)
     assert(isinstance(opt.gpu,int)) # disable multi-GPU support for now, single is enough
-    opt.device = "cpu" if opt.cpu or not torch.cuda.is_available() else "cuda:{}".format(opt.gpu)
+    opt.device = "cuda"
+    # opt.device = "cpu" if opt.cpu or not torch.cuda.is_available() else "cuda:{}".format(opt.gpu)
     opt.H,opt.W = opt.data.image_size
 
 def save_options_file(opt):

@@ -12,6 +12,7 @@ from easydict import EasyDict as edict
 
 import util,util_vis
 from util import log,debug
+import torch.nn as nn
 
 # ============================ main engine for training and evaluation ============================
 
@@ -19,6 +20,7 @@ class Model():
 
     def __init__(self,opt):
         super().__init__()
+        self.opt = opt
         os.makedirs(opt.output_path,exist_ok=True)
 
     def load_dataset(self,opt,eval_split="val"):
@@ -34,17 +36,23 @@ class Model():
     def build_networks(self,opt):
         graph = importlib.import_module("model.{}".format(opt.model))
         log.info("building networks...")
-        self.graph = graph.Graph(opt).to(opt.device)
+        net = graph.Graph(opt)
+        self.graph = net
+        # self.graph = graph.Graph(opt).to(opt.device)
 
     def setup_optimizer(self,opt):
+        self.graph = nn.DataParallel(self.graph)
+        self.graph = self.graph.to("cuda")
         log.info("setting up optimizers...")
         optimizer = getattr(torch.optim,opt.optim.algo)
-        self.optim = optimizer([dict(params=self.graph.parameters(),lr=opt.optim.lr)])
+        self.optim = optimizer([dict(params=self.graph.module.parameters(),lr=opt.optim.lr)])
         # set up scheduler
         if opt.optim.sched:
             scheduler = getattr(torch.optim.lr_scheduler,opt.optim.sched.type)
             kwargs = { k:v for k,v in opt.optim.sched.items() if k!="type" }
             self.sched = scheduler(self.optim,**kwargs)
+        # self.graph = nn.DataParallel(self.graph)
+        # self.graph = self.graph.to(opt.device)
 
     def restore_checkpoint(self,opt):
         epoch_start,iter_start = None,None
@@ -113,9 +121,10 @@ class Model():
         self.timer.it_start = time.time()
         # train iteration
         self.optim.zero_grad()
-        var = self.graph.forward(opt,var,mode="train")
-        loss = self.graph.compute_loss(opt,var,mode="train")
-        loss = self.summarize_loss(opt,var,loss)
+        var = dict(var)
+        var = self.graph.forward(var,mode="train")
+        loss = self.graph.module.compute_loss(var,mode="train")
+        loss = self.summarize_loss(var,loss)
         loss.all.backward()
         self.optim.step()
         # after train iteration
@@ -127,36 +136,39 @@ class Model():
         util.update_timer(opt,self.timer,self.ep,len(loader))
         return loss
 
-    def summarize_loss(self,opt,var,loss):
+    def summarize_loss(self,var,loss):
         loss_all = 0.
         assert("all" not in loss)
         # weigh losses
         for key in loss:
-            assert(key in opt.loss_weight)
+            assert(key in self.opt.loss_weight)
             assert(loss[key].shape==())
-            if opt.loss_weight[key] is not None:
+            if self.opt.loss_weight[key] is not None:
                 assert not torch.isinf(loss[key]),"loss {} is Inf".format(key)
                 assert not torch.isnan(loss[key]),"loss {} is NaN".format(key)
-                loss_all += 10**float(opt.loss_weight[key])*loss[key]
+                loss_all += 10**float(self.opt.loss_weight[key])*loss[key]
         loss.update(all=loss_all)
         return loss
 
     @torch.no_grad()
-    def validate(self,opt,ep=None):
+    def validate(self,ep=None):
+        opt = self.opt
         self.graph.eval()
         loss_val = edict()
         loader = tqdm.tqdm(self.test_loader,desc="validating",leave=False)
         for it,batch in enumerate(loader):
-            var = edict(batch)
+            var = dict(batch)
+            # print(type(batch), batch.keys())
             var = util.move_to_device(var,opt.device)
-            var = self.graph.forward(opt,var,mode="val")
-            loss = self.graph.compute_loss(opt,var,mode="val")
-            loss = self.summarize_loss(opt,var,loss)
+            # print(type(batch), batch.keys())
+            var = self.graph.forward(var,mode="val")
+            loss = self.graph.module.compute_loss(var,mode="val")
+            loss = self.summarize_loss(var,loss)
             for key in loss:
                 loss_val.setdefault(key,0.)
-                loss_val[key] += loss[key]*len(var.idx)
+                loss_val[key] += loss[key]*len(var["idx"])
             loader.set_postfix(loss="{:.3f}".format(loss.all))
-            if it==0: self.visualize(opt,var,step=ep,split="val")
+            if it==0: self.visualize(var,step=ep,split="val")
         for key in loss_val: loss_val[key] /= len(self.test_data)
         self.log_scalars(opt,var,loss_val,step=ep,split="val")
         log.loss_val(opt,loss_val.all)
@@ -172,7 +184,7 @@ class Model():
                 self.tb.add_scalar("{0}/{1}".format(split,key),value,step)
 
     @torch.no_grad()
-    def visualize(self,opt,var,step=0,split="train"):
+    def visualize(self,var,step=0,split="train"):
         raise NotImplementedError
 
     def save_checkpoint(self,opt,ep=0,it=0,latest=False):
@@ -186,8 +198,9 @@ class Graph(torch.nn.Module):
 
     def __init__(self,opt):
         super().__init__()
+        self.opt = opt
 
-    def forward(self,opt,var,mode=None):
+    def forward(self,var,mode=None):
         raise NotImplementedError
         return var
 

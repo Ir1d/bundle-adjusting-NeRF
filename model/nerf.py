@@ -1,6 +1,7 @@
 import numpy as np
 import os,sys,time
 import torch
+import torch.nn as nn
 import torch.nn.functional as torch_F
 import torchvision
 import torchvision.transforms.functional as torchvision_F
@@ -30,11 +31,13 @@ class Model(base.Model):
         self.train_data.all = edict(util.move_to_device(self.train_data.all,opt.device))
 
     def setup_optimizer(self,opt):
+        self.graph = nn.DataParallel(self.graph)
+        self.graph = self.graph.to("cuda")
         log.info("setting up optimizers...")
         optimizer = getattr(torch.optim,opt.optim.algo)
-        self.optim = optimizer([dict(params=self.graph.nerf.parameters(),lr=opt.optim.lr)])
+        self.optim = optimizer([dict(params=self.graph.module.nerf.parameters(),lr=opt.optim.lr)])
         if opt.nerf.fine_sampling:
-            self.optim.add_param_group(dict(params=self.graph.nerf_fine.parameters(),lr=opt.optim.lr))
+            self.optim.add_param_group(dict(params=self.graph.module.nerf_fine.parameters(),lr=opt.optim.lr))
         # set up scheduler
         if opt.optim.sched:
             scheduler = getattr(torch.optim.lr_scheduler,opt.optim.sched.type)
@@ -51,7 +54,7 @@ class Model(base.Model):
         self.graph.train()
         self.ep = 0 # dummy for timer
         # training
-        if self.iter_start==0: self.validate(opt,0)
+        if self.iter_start==0: self.validate(0)
         loader = tqdm.trange(opt.max_iter,desc="training",leave=False)
         for self.it in loader:
             if self.it<self.iter_start: continue
@@ -86,18 +89,19 @@ class Model(base.Model):
             self.tb.add_scalar("{0}/{1}".format(split,"PSNR_fine"),psnr,step)
 
     @torch.no_grad()
-    def visualize(self,opt,var,step=0,split="train",eps=1e-10):
+    def visualize(self,var,step=0,split="train",eps=1e-10):
+        opt = self.opt
         if opt.tb:
-            util_vis.tb_image(opt,self.tb,step,split,"image",var.image)
+            util_vis.tb_image(opt,self.tb,step,split,"image",var["image"])
             if not opt.nerf.rand_rays or split!="train":
-                invdepth = (1-var.depth)/var.opacity if opt.camera.ndc else 1/(var.depth/var.opacity+eps)
-                rgb_map = var.rgb.view(-1,opt.H,opt.W,3).permute(0,3,1,2) # [B,3,H,W]
+                invdepth = (1-var["depth"])/var["opacity"] if opt.camera.ndc else 1/(var["depth"]/var["opacity"]+eps)
+                rgb_map = var["rgb"].view(-1,opt.H,opt.W,3).permute(0,3,1,2) # [B,3,H,W]
                 invdepth_map = invdepth.view(-1,opt.H,opt.W,1).permute(0,3,1,2) # [B,1,H,W]
                 util_vis.tb_image(opt,self.tb,step,split,"rgb",rgb_map)
                 util_vis.tb_image(opt,self.tb,step,split,"invdepth",invdepth_map)
                 if opt.nerf.fine_sampling:
-                    invdepth = (1-var.depth_fine)/var.opacity_fine if opt.camera.ndc else 1/(var.depth_fine/var.opacity_fine+eps)
-                    rgb_map = var.rgb_fine.view(-1,opt.H,opt.W,3).permute(0,3,1,2) # [B,3,H,W]
+                    invdepth = (1-var["depth_fine"])/var["opacity_fine"] if opt.camera.ndc else 1/(var["depth_fine"]/var["opacity_fine"]+eps)
+                    rgb_map = var["rgb_fine"].view(-1,opt.H,opt.W,3).permute(0,3,1,2) # [B,3,H,W]
                     invdepth_map = invdepth.view(-1,opt.H,opt.W,1).permute(0,3,1,2) # [B,1,H,W]
                     util_vis.tb_image(opt,self.tb,step,split,"rgb_fine",rgb_map)
                     util_vis.tb_image(opt,self.tb,step,split,"invdepth_fine",invdepth_map)
@@ -121,18 +125,18 @@ class Model(base.Model):
             if opt.model=="barf" and opt.optim.test_photo:
                 # run test-time optimization to factorize imperfection in optimized poses from view synthesis evaluation
                 var = self.evaluate_test_time_photometric_optim(opt,var)
-            var = self.graph.forward(opt,var,mode="eval")
+            var = self.graph.forward(var,mode="eval")
             # evaluate view synthesis
-            invdepth = (1-var.depth)/var.opacity if opt.camera.ndc else 1/(var.depth/var.opacity+eps)
-            rgb_map = var.rgb.view(-1,opt.H,opt.W,3).permute(0,3,1,2) # [B,3,H,W]
+            invdepth = (1-var["depth"])/var["opacity"] if opt.camera.ndc else 1/(var["depth"]/var["opacity"]+eps)
+            rgb_map = var["rgb"].view(-1,opt.H,opt.W,3).permute(0,3,1,2) # [B,3,H,W]
             invdepth_map = invdepth.view(-1,opt.H,opt.W,1).permute(0,3,1,2) # [B,1,H,W]
-            psnr = -10*self.graph.MSE_loss(rgb_map,var.image).log10().item()
-            ssim = pytorch_ssim.ssim(rgb_map,var.image).item()
-            lpips = self.lpips_loss(rgb_map*2-1,var.image*2-1).item()
+            psnr = -10*self.graph.MSE_loss(rgb_map,var["image"]).log10().item()
+            ssim = pytorch_ssim.ssim(rgb_map,var["image"]).item()
+            lpips = self.lpips_loss(rgb_map*2-1,var["image"]*2-1).item()
             res.append(edict(psnr=psnr,ssim=ssim,lpips=lpips))
             # dump novel views
             torchvision_F.to_pil_image(rgb_map.cpu()[0]).save("{}/rgb_{}.png".format(test_path,i))
-            torchvision_F.to_pil_image(var.image.cpu()[0]).save("{}/rgb_GT_{}.png".format(test_path,i))
+            torchvision_F.to_pil_image(var["image"].cpu()[0]).save("{}/rgb_GT_{}.png".format(test_path,i))
             torchvision_F.to_pil_image(invdepth_map.cpu()[0]).save("{}/depth_{}.png".format(test_path,i))
         # show results in terminal
         print("--------------------------")
@@ -197,37 +201,48 @@ class Graph(base.Graph):
         if opt.nerf.fine_sampling:
             self.nerf_fine = NeRF(opt)
 
-    def forward(self,opt,var,mode=None):
-        batch_size = len(var.idx)
+    def forward(self,var,mode=None):
+        opt = self.opt
+        # print(var)
+        batch_size = len(var["idx"])
         pose = self.get_pose(opt,var,mode=mode)
         # render images
         if opt.nerf.rand_rays and mode in ["train","test-optim"]:
             # sample random rays for optimization
-            var.ray_idx = torch.randperm(opt.H*opt.W,device=opt.device)[:opt.nerf.rand_rays//batch_size]
-            ret = self.render(opt,pose,intr=var.intr,ray_idx=var.ray_idx,mode=mode) # [B,N,3],[B,N,1]
+            ray_idx = torch.randperm(opt.H*opt.W,device=opt.device)[:opt.nerf.rand_rays]
+            # NOTE: dejia: per GPU, no need to divide by bs
+            # ray_idx = torch.randperm(opt.H*opt.W,device=opt.device)[:opt.nerf.rand_rays//batch_size]
+            ret = self.render(opt,pose,intr=var["intr"],ray_idx=ray_idx,mode=mode) # [B,N,3],[B,N,1]
+            var["ray_idx"] = ray_idx
         else:
             # render full image (process in slices)
-            ret = self.render_by_slices(opt,pose,intr=var.intr,mode=mode) if opt.nerf.rand_rays else \
-                  self.render(opt,pose,intr=var.intr,mode=mode) # [B,HW,3],[B,HW,1]
-        var.update(ret)
+            ret = self.render_by_slices(opt,pose,intr=var["intr"],mode=mode) if opt.nerf.rand_rays else \
+                  self.render(opt,pose,intr=var["intr"],mode=mode) # [B,HW,3],[B,HW,1]
+        # var["update"](ret)
+        # print(ret)
+        for k, v in ret.items():
+            var[k] = v
+        # var["ret"] = ret
         return var
 
-    def compute_loss(self,opt,var,mode=None):
+    def compute_loss(self,var,mode=None):
         loss = edict()
-        batch_size = len(var.idx)
-        image = var.image.view(batch_size,3,opt.H*opt.W).permute(0,2,1)
+        opt = self.opt
+        batch_size = len(var["idx"])
+        image = var["image"].view(batch_size,3,opt.H*opt.W).permute(0,2,1)
         if opt.nerf.rand_rays and mode in ["train","test-optim"]:
-            image = image[:,var.ray_idx]
+            image = image[:,var["ray_idx"]]
         # compute image losses
         if opt.loss_weight.render is not None:
-            loss.render = self.MSE_loss(var.rgb,image)
+            # print(var['rgb'].shape, image.shape)
+            loss.render = self.MSE_loss(var["rgb"],image)
         if opt.loss_weight.render_fine is not None:
             assert(opt.nerf.fine_sampling)
-            loss.render_fine = self.MSE_loss(var.rgb_fine,image)
+            loss.render_fine = self.MSE_loss(var["rgb_fine"],image)
         return loss
 
     def get_pose(self,opt,var,mode=None):
-        return var.pose
+        return var["pose"]
 
     def render(self,opt,pose,intr=None,ray_idx=None,mode=None):
         batch_size = len(pose)
@@ -308,6 +323,7 @@ class NeRF(torch.nn.Module):
     def __init__(self,opt):
         super().__init__()
         self.define_network(opt)
+        self.opt = opt
 
     def define_network(self,opt):
         input_3D_dim = 3+6*opt.arch.posenc.L_3D if opt.arch.posenc else 3
@@ -347,12 +363,14 @@ class NeRF(torch.nn.Module):
             torch.nn.init.xavier_uniform_(linear.weight,gain=relu_gain)
         torch.nn.init.zeros_(linear.bias)
 
-    def forward(self,opt,points_3D,ray_unit=None,mode=None): # [B,...,3]
+    def forward(self,points_3D,ray_unit=None,mode=None): # [B,...,3]
+        opt = self.opt
         if opt.arch.posenc:
             points_enc = self.positional_encoding(opt,points_3D,L=opt.arch.posenc.L_3D)
             points_enc = torch.cat([points_3D,points_enc],dim=-1) # [B,...,6L+3]
         else: points_enc = points_3D
         feat = points_enc
+        # print(feat.device, self.mlp_feat[0].device)
         # extract coordinate-based features
         for li,layer in enumerate(self.mlp_feat):
             if li in opt.arch.skip: feat = torch.cat([feat,points_enc],dim=-1)
@@ -386,7 +404,7 @@ class NeRF(torch.nn.Module):
             ray_unit = torch_F.normalize(ray,dim=-1) # [B,HW,3]
             ray_unit_samples = ray_unit[...,None,:].expand_as(points_3D_samples) # [B,HW,N,3]
         else: ray_unit_samples = None
-        rgb_samples,density_samples = self.forward(opt,points_3D_samples,ray_unit=ray_unit_samples,mode=mode) # [B,HW,N],[B,HW,N,3]
+        rgb_samples,density_samples = self.forward(points_3D_samples,ray_unit=ray_unit_samples,mode=mode) # [B,HW,N],[B,HW,N,3]
         return rgb_samples,density_samples
 
     def composite(self,opt,ray,rgb_samples,density_samples,depth_samples):

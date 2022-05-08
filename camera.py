@@ -51,6 +51,7 @@ class Pose():
 
     def compose_pair(self,pose_a,pose_b):
         # pose_new(x) = pose_b o pose_a(x)
+        # print(pose_a.device, pose_b.device)
         R_a,t_a = pose_a[...,:3],pose_a[...,3:]
         R_b,t_b = pose_b[...,:3],pose_b[...,3:]
         R_new = R_b@R_a
@@ -210,6 +211,7 @@ def img2cam(X,cam_intr):
 def cam2world(X,pose):
     X_hom = to_hom(X)
     pose_inv = Pose().invert(pose)
+    # print(X_hom.device, pose_inv.device)
     return X_hom@pose_inv.transpose(-1,-2)
 
 def angle_to_rotation_matrix(a,axis):

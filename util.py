@@ -104,7 +104,8 @@ def move_to_device(X,device):
         dd = move_to_device(dd,device)
         return type(X)(**dd)
     elif isinstance(X,torch.Tensor):
-        return X.to(device=device)
+        return X.cuda()
+        # return X.to(device=device)
     return X
 
 def to_dict(D,dict_type=dict):
